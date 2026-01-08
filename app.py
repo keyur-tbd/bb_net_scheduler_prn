@@ -69,7 +69,7 @@ class BigBasketScheduler:
             'search_term': 'prn',
             'days_back': 2,
             'max_results': 10,
-            'gdrive_folder_id': '1l5L9IdQ8WcV6AZ04JCeuyxvbNkLPJnHt'
+            'gdrive_folder_id': '1d7IQKzv4xLwj-c4q6F0qB0LWbhviAVMa'
         }
         
         self.excel_config = {
