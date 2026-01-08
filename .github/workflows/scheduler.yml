@@ -1,4 +1,4 @@
-name: BigBasket Automation Scheduler
+name: BigBasket Automation Scheduler PRN
 
 on:
   # Run every 3 hours
