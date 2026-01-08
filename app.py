@@ -73,7 +73,7 @@ class BigBasketScheduler:
         }
         
         self.excel_config = {
-            'excel_folder_id': '1d7IQKzv4xLwj-c4q6F0qB0LWbhviAVMa',
+            'excel_folder_id': '1iN2Q0Pmb-QFnOPWCRwarJesbaC6FwUWC',
             'spreadsheet_id': '170WUaPhkuxCezywEqZXJtHRw3my3rpjB9lJOvfLTeKM',
             'sheet_name': 'bbalertprn',
             'summary_sheet_name': 'net_workflow_logs',
