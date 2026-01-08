@@ -66,17 +66,17 @@ class BigBasketScheduler:
         # Hardcoded configurations
         self.gmail_config = {
             'sender': 'bbnet2@bigbasket.com',
-            'search_term': 'grn',
+            'search_term': 'prn',
             'days_back': 2,
             'max_results': 10,
             'gdrive_folder_id': '1l5L9IdQ8WcV6AZ04JCeuyxvbNkLPJnHt'
         }
         
         self.excel_config = {
-            'excel_folder_id': '1fdio9_h28UleeRjgRnWF32S8kg_fgWbs',
+            'excel_folder_id': '1d7IQKzv4xLwj-c4q6F0qB0LWbhviAVMa',
             'spreadsheet_id': '170WUaPhkuxCezywEqZXJtHRw3my3rpjB9lJOvfLTeKM',
-            'sheet_name': 'bbalertgrn_2',
-            'summary_sheet_name': 'net_workflow_log',
+            'sheet_name': 'bbalertprn',
+            'summary_sheet_name': 'net_workflow_logs',
             'header_row': 2
         }
         
