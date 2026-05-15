@@ -761,7 +761,22 @@ class BigBasketScheduler:
             return []
     
     def _read_excel_file_robust(self, file_id: str, filename: str, header_row: int) -> pd.DataFrame:
-        """Read Excel file with robust parsing"""
+        """Read Excel file with robust parsing.
+        
+        FIX: After pandas reads the file it may produce 'Unnamed: N' columns for
+        blank header cells.  These are stripped immediately after reading, before
+        _clean_dataframe runs, so the schema only ever contains real header names.
+        """
+        def _drop_pandas_unnamed(df: pd.DataFrame) -> pd.DataFrame:
+            """Remove pandas auto-generated 'Unnamed: N' columns."""
+            _UNNAMED_RE = re.compile(r'^Unnamed:\s*\d+$', re.IGNORECASE)
+            before = list(df.columns)
+            keep = [c for c in df.columns if not _UNNAMED_RE.match(str(c).strip())]
+            dropped = set(before) - set(keep)
+            if dropped:
+                logger.info(f"[schema] pandas read dropped {len(dropped)} 'Unnamed' columns: {sorted(dropped)}")
+            return df[keep]
+
         try:
             request = self.drive_service.files().get_media(fileId=file_id)
             file_stream = io.BytesIO()
@@ -779,6 +794,7 @@ class BigBasketScheduler:
                 else:
                     df = pd.read_excel(file_stream, engine="openpyxl", header=header_row)
                 if not df.empty:
+                    df = _drop_pandas_unnamed(df)
                     return self._clean_dataframe(df)
             except Exception:
                 pass
@@ -791,6 +807,7 @@ class BigBasketScheduler:
                     else:
                         df = pd.read_excel(file_stream, engine="xlrd", header=header_row)
                     if not df.empty:
+                        df = _drop_pandas_unnamed(df)
                         return self._clean_dataframe(df)
                 except Exception:
                     pass
@@ -806,7 +823,12 @@ class BigBasketScheduler:
             return pd.DataFrame()
     
     def _try_raw_xml_extraction(self, file_stream: io.BytesIO, header_row: int) -> pd.DataFrame:
-        """Raw XML extraction for corrupted Excel files"""
+        """Raw XML extraction for corrupted Excel files.
+        
+        FIX: Headers are now built using only non-blank cell values from the header row.
+        Columns whose header cell is blank or whitespace-only are silently dropped here
+        so they never reach _clean_dataframe as 'Column_N' placeholders.
+        """
         try:
             file_stream.seek(0)
             with zipfile.ZipFile(file_stream, 'r') as zip_ref:
@@ -876,12 +898,44 @@ class BigBasketScheduler:
                         return pd.DataFrame()
                     
                     if header_row == -1:
-                        headers = [f"Column_{i+1}" for i in range(len(data[0]))]
+                        # No header row: keep all columns but mark unnamed ones for removal
+                        # in _clean_dataframe rather than assigning Column_N names.
+                        headers = [f"__unnamed_{i}__" for i in range(len(data[0]))]
                         return pd.DataFrame(data, columns=headers)
                     else:
                         if len(data) > header_row:
-                            headers = [str(h) if h else f"Column_{i+1}" for i, h in enumerate(data[header_row])]
-                            return pd.DataFrame(data[header_row+1:], columns=headers)
+                            raw_headers = data[header_row]
+                            # FIX: Only keep columns that have a real, non-blank header value.
+                            # Map col_index -> cleaned header name for valid columns only.
+                            valid_col_indices = []
+                            headers = []
+                            seen_names: Dict[str, int] = {}
+                            for i, h in enumerate(raw_headers):
+                                h_str = str(h).strip() if h is not None else ""
+                                # Skip blank, whitespace-only, or 'nan' header cells entirely.
+                                if not h_str or h_str.lower() == "nan":
+                                    continue
+                                # De-duplicate header names by suffixing with _2, _3, etc.
+                                if h_str in seen_names:
+                                    seen_names[h_str] += 1
+                                    h_str = f"{h_str}_{seen_names[h_str]}"
+                                else:
+                                    seen_names[h_str] = 1
+                                valid_col_indices.append(i)
+                                headers.append(h_str)
+                            
+                            if not headers:
+                                logger.warning("XML extraction: no valid header cells found in header row")
+                                return pd.DataFrame()
+                            
+                            # Slice only valid columns from every data row
+                            trimmed_rows = [
+                                [row[i] if i < len(row) else "" for i in valid_col_indices]
+                                for row in data[header_row + 1:]
+                            ]
+                            logger.info(f"XML extraction produced {len(headers)} named columns "
+                                        f"(skipped {len(raw_headers) - len(headers)} unnamed columns)")
+                            return pd.DataFrame(trimmed_rows, columns=headers)
                         else:
                             return pd.DataFrame()
                 
@@ -901,26 +955,55 @@ class BigBasketScheduler:
         except ValueError:
             return value
     
-    def _clean_dataframe(self, df):
-        """Clean DataFrame"""
+    def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean DataFrame and drop unnamed/generated columns.
+        
+        FIX: Columns whose name matches the auto-generated patterns
+        ('Unnamed: N', 'Column_N', '__unnamed_N__', pure-integer pandas
+        default indices, or blank strings) are dropped BEFORE any further
+        processing so they never reach Google Sheets or schema alignment.
+        """
         if df.empty:
             return df
-        
+
+        # ── 1. Drop unnamed / auto-generated columns ──────────────────────────
+        _UNNAMED_RE = re.compile(
+            r'^(Unnamed:\s*\d+|Column_\d+|__unnamed_\d+__|nan|\d+)$',
+            re.IGNORECASE
+        )
+        original_cols = list(df.columns)
+        valid_cols = [
+            c for c in df.columns
+            if str(c).strip() and not _UNNAMED_RE.match(str(c).strip())
+        ]
+        dropped = set(original_cols) - set(valid_cols)
+        if dropped:
+            logger.info(f"[schema] Dropped {len(dropped)} unnamed/generated columns: {sorted(dropped)}")
+        df = df[valid_cols].copy()
+
+        if df.empty:
+            return df
+
+        # ── 2. Strip whitespace & remove stray apostrophes from string cells ──
         string_columns = df.select_dtypes(include=['object']).columns
         for col in string_columns:
             df[col] = df[col].astype(str).str.strip().str.replace("'", "", regex=False)
-        
+
+        # ── 3. Drop rows where the second valid column is blank (sub-header rows)
         if len(df.columns) >= 2:
             second_col = df.columns[1]
             mask = ~(
-                df[second_col].isna() | 
+                df[second_col].isna() |
                 (df[second_col].astype(str).str.strip() == "") |
                 (df[second_col].astype(str).str.strip() == "nan")
             )
             df = df[mask]
-        
+
+        # ── 4. Drop exact duplicate rows ──────────────────────────────────────
         df = df.drop_duplicates()
-        
+
+        logger.info(f"[schema] _clean_dataframe produced {len(df)} rows × "
+                    f"{len(df.columns)} columns: {list(df.columns)}")
         return df
     
     def _check_sheet_headers(self, spreadsheet_id: str, sheet_name: str) -> bool:
@@ -934,8 +1017,57 @@ class BigBasketScheduler:
         except:
             return False
     
-    def _append_to_sheet(self, spreadsheet_id: str, sheet_name: str, df: pd.DataFrame, append_headers: bool):
-        """Append DataFrame to Google Sheet"""
+    def _get_sheet_schema(self, spreadsheet_id: str, sheet_name: str) -> List[str]:
+        """Return the current header row of the sheet as a list of strings.
+        
+        Returns an empty list if the sheet has no data yet.
+        """
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!1:1"
+            ).execute()
+            rows = result.get('values', [])
+            if rows:
+                return [str(h).strip() for h in rows[0] if str(h).strip()]
+            return []
+        except Exception as e:
+            logger.warning(f"[schema] Could not read sheet headers: {e}")
+            return []
+
+    def _extend_sheet_schema(self, spreadsheet_id: str, sheet_name: str,
+                              current_schema: List[str], new_cols: List[str]) -> List[str]:
+        """Append new_cols to the header row in the sheet and return the updated schema."""
+        updated = current_schema + new_cols
+        try:
+            self.sheets_service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!1:1",
+                valueInputOption='RAW',
+                body={'values': [updated]}
+            ).execute()
+            logger.info(f"[schema] Extended sheet schema with {len(new_cols)} new columns: {new_cols}")
+        except Exception as e:
+            logger.error(f"[schema] Failed to extend sheet schema: {e}")
+        return updated
+
+    def _append_to_sheet(self, spreadsheet_id: str, sheet_name: str,
+                          df: pd.DataFrame, append_headers: bool) -> None:
+        """Append DataFrame to Google Sheet, aligning to the sheet's master schema.
+
+        Schema-alignment logic
+        ──────────────────────
+        1. Read the current header row from the sheet (source of truth).
+        2. Identify columns present in df but missing from the sheet schema
+           → extend the sheet header row with those new columns.
+        3. Identify columns present in the sheet schema but missing in df
+           → add them to df filled with empty strings.
+        4. Reindex df to exactly the sheet column order before appending.
+
+        This guarantees every append lands in the right column regardless of
+        whether the incoming file is format A (fewer columns) or format B
+        (extra columns), and regardless of column order inside the file.
+        """
         try:
             def process_value(v):
                 if math.isnan(v) if isinstance(v, float) else pd.isna(v):
@@ -943,31 +1075,64 @@ class BigBasketScheduler:
                 if isinstance(v, (int, float)):
                     return v
                 return str(v) if v is not None else ''
-            
+
+            # ── Step 1: determine / initialise the master schema ──────────────
+            sheet_schema: List[str] = self._get_sheet_schema(spreadsheet_id, sheet_name)
+            df_cols: List[str] = list(df.columns)
+
+            if not sheet_schema:
+                # Sheet is empty – this df defines the initial schema.
+                sheet_schema = df_cols
+                logger.info(f"[schema] Initialising sheet schema with {len(sheet_schema)} columns: {sheet_schema}")
+                # We'll write the header row as part of the append below (append_headers=True).
+            else:
+                logger.info(f"[schema] Detected sheet schema ({len(sheet_schema)} cols): {sheet_schema}")
+
+                # ── Step 2: find genuinely new columns brought by this file ───
+                schema_set = set(sheet_schema)
+                new_cols = [c for c in df_cols if c not in schema_set]
+                if new_cols:
+                    logger.info(f"[schema] New columns found in file, extending schema: {new_cols}")
+                    sheet_schema = self._extend_sheet_schema(
+                        spreadsheet_id, sheet_name, sheet_schema, new_cols
+                    )
+
+                # ── Step 3: add missing columns to df filled with '' ──────────
+                missing_in_df = [c for c in sheet_schema if c not in df.columns]
+                if missing_in_df:
+                    logger.info(f"[schema] Columns missing in this file, filling with blanks: {missing_in_df}")
+                    for col in missing_in_df:
+                        df[col] = ''
+
+                # ── Step 4: reindex df to match sheet column order exactly ─────
+                df = df.reindex(columns=sheet_schema, fill_value='')
+                logger.info(f"[schema] df reindexed to {len(df.columns)} columns matching sheet order")
+
+            # ── Build values list ─────────────────────────────────────────────
             values = []
             if append_headers:
                 values.append([str(col) for col in df.columns])
-            
+
             data_rows = [[process_value(cell) for cell in row] for row in df.itertuples(index=False)]
             values += data_rows
-            
+
             if not values:
                 return
-            
+
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
                 range=f"{sheet_name}!A:A"
             ).execute()
             existing_rows = result.get('values', [])
             start_row = len(existing_rows) + 1 if existing_rows else 1
-            
+
             self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
                 range=f"{sheet_name}!A{start_row}",
                 valueInputOption="RAW",
                 body={"values": values}
             ).execute()
-            
+
         except Exception as e:
             logger.error(f"Error appending to sheet: {str(e)}")
             raise
