@@ -67,7 +67,7 @@ class BigBasketScheduler:
         self.gmail_config = {
             'sender': 'bbnet2@bigbasket.com',
             'search_term': 'prn',
-            'days_back': 15,
+            'days_back': 140,
             'max_results': 1000,
             'gdrive_folder_id': '1d7IQKzv4xLwj-c4q6F0qB0LWbhviAVMa'
         }
