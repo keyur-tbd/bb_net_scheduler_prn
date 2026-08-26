@@ -75,3 +75,5 @@ temp/
 # GitHub Actions
 .github/workflows/*.yml
 !/.github/workflows/bigbasket_scheduler.yml
+.env
+.venv/
