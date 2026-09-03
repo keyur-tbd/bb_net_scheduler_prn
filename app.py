@@ -27,6 +27,7 @@ import re
 import zipfile
 import math
 import sys
+from etl_alerts import guard
 
 warnings.filterwarnings("ignore")
 
@@ -1523,6 +1524,9 @@ Total errors: {len(self.execution_stats['errors'])}
 
 def main():
     """Main function to set up and run the scheduler"""
+    # Shared disk guard: refuse to write if this pipeline is over its budget
+    # or the volume is full. Emails on warn/stop. Fails open. See etl_alerts.py.
+    guard("grn")
     import argparse
     
     parser = argparse.ArgumentParser(description='BigBasket Automation Scheduler')
