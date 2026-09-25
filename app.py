@@ -279,11 +279,18 @@ class BigBasketScheduler:
             
             max_results = max(max_results, 1) if max_results else 1
             
-            result = self.gmail_service.users().messages().list(
-                userId='me', q=query, maxResults=max_results
-            ).execute()
-            
-            messages = result.get('messages', [])
+            # Gmail returns at most 500 ids per page whatever maxResults says, so a busy
+            # window would silently drop the rest. Page until max_results or the end.
+            messages, page_token = [], None
+            while len(messages) < max_results:
+                result = self.gmail_service.users().messages().list(
+                    userId='me', q=query, pageToken=page_token,
+                    maxResults=min(500, max_results - len(messages))
+                ).execute()
+                messages.extend(result.get('messages', []))
+                page_token = result.get('nextPageToken')
+                if not page_token:
+                    break
             self.execution_stats['emails_checked'] = len(messages)
             logger.info(f"Found {len(messages)} emails matching criteria")
             
@@ -733,14 +740,20 @@ class BigBasketScheduler:
                      f"mimeType='application/vnd.ms-excel') and "
                      f"createdTime > '{start_date_str}' and trashed=false")
             
-            results = self.drive_service.files().list(
-                q=query,
-                fields="files(id, name, createdTime)",
-                orderBy='createdTime desc',
-                pageSize=max_results
-            ).execute()
-            
-            files = results.get('files', [])
+            # Drive pages at 1,000 files; a pageSize above that fails the whole listing.
+            files, page_token = [], None
+            while len(files) < max_results:
+                results = self.drive_service.files().list(
+                    q=query,
+                    fields="nextPageToken, files(id, name, createdTime)",
+                    orderBy='createdTime desc',
+                    pageSize=min(1000, max_results - len(files)),
+                    pageToken=page_token
+                ).execute()
+                files.extend(results.get('files', []))
+                page_token = results.get('nextPageToken')
+                if not page_token:
+                    break
             logger.info(f"Found {len(files)} Excel files in folder {folder_id}")
             return files
             
