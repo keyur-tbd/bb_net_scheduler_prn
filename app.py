@@ -28,6 +28,7 @@ import zipfile
 import math
 import sys
 from etl_alerts import guard
+import bb_alert_prn
 
 warnings.filterwarnings("ignore")
 
@@ -72,7 +73,15 @@ class BigBasketScheduler:
             'max_results': 1000,
             'gdrive_folder_id': '1d7IQKzv4xLwj-c4q6F0qB0LWbhviAVMa'
         }
-        
+
+        # Depots moved to BigBasket's WMS mail PRNs from here instead (see bb_alert_prn.py).
+        # Handover mails only: each PRN also has an Initiated mail with the same lines.
+        self.alert_config = {
+            'sender': 'alerts@bigbasket.com',
+            'handover_phrase': 'PRN handovered',
+            'initiated_phrase': 'PRN Initiated',
+        }
+
         self.excel_config = {
             'excel_folder_id': '1iN2Q0Pmb-QFnOPWCRwarJesbaC6FwUWC',
             'spreadsheet_id': '170WUaPhkuxCezywEqZXJtHRw3my3rpjB9lJOvfLTeKM',
@@ -383,6 +392,131 @@ class BigBasketScheduler:
             self.execution_stats['errors'].append(error_msg)
             return {'success': False, 'processed': 0}
     
+    def _alert_mail_date(self, internal_date: Any) -> datetime:
+        """A Gmail internalDate as an India date (the runner's clock is UTC)."""
+        ist = timezone(timedelta(hours=5, minutes=30))
+        return datetime.fromtimestamp(int(internal_date) / 1000, tz=ist).date()
+
+    def _alert_initiated_date(self, prn: str, fc: str):
+        """The date BigBasket initiated this PRN, from its Initiated mail; None if not found."""
+        config = self.alert_config
+        result = self.gmail_service.users().messages().list(
+            userId='me', maxResults=10,
+            q=f'from:"{config["sender"]}" subject:"{config["initiated_phrase"]}" subject:"PRN No: {prn}"'
+        ).execute()
+        for found in result.get('messages', []):
+            message = self.gmail_service.users().messages().get(
+                userId='me', id=found['id'], format='metadata', metadataHeaders=['Subject']
+            ).execute()
+            subject = next((h['value'] for h in message['payload'].get('headers', [])
+                            if h['name'] == 'Subject'), '')
+            if f'<{fc}>' in subject and f'<PRN No: {prn}>' in subject:
+                return self._alert_mail_date(message['internalDate'])
+        return None
+
+    def process_alert_prn_workflow(self):
+        """WMS depots' handover mails -> Drive, in the old file layout, beside the bbnet2 files.
+
+        They go in excel_folder_id rather than a folder named after the sender, because that
+        one folder is all the Excel step and supabase_sink.py read. A file that cannot be read is
+        reported and retried next run, since Gmail is searched back days_back days each time.
+        """
+        try:
+            logger.info("=" * 60)
+            logger.info("STARTING WMS ALERT PRN WORKFLOW")
+            logger.info("=" * 60)
+
+            config = self.alert_config
+            checked_before = self.execution_stats['emails_checked']
+            emails = self.search_emails(
+                sender=config['sender'],
+                search_term=config['handover_phrase'],
+                days_back=self.gmail_config['days_back'],
+                max_results=self.gmail_config['max_results']
+            )
+            self.execution_stats['emails_checked'] += checked_before
+            if not emails:
+                logger.info("No WMS PRN handover mails found")
+                return {'success': True, 'processed': 0}
+
+            folder_id = self.excel_config['excel_folder_id']
+            existing_files = self._get_existing_files_in_folder(folder_id)
+            saved = skipped = failed = found = 0
+
+            for email in emails:
+                try:
+                    message = self.gmail_service.users().messages().get(
+                        userId='me', id=email['id'], format='full'
+                    ).execute()
+                    headers = message['payload'].get('headers', [])
+                    subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
+                    if config['handover_phrase'].lower() not in subject.lower():
+                        continue    # the phrase only appeared in a body or a reply
+
+                    parts, stack = [], [message['payload']]
+                    while stack:
+                        part = stack.pop()
+                        stack.extend(part.get('parts', []) or [])
+                        if (part.get('filename', '').lower().endswith('.xlsx')
+                                and part.get('body', {}).get('attachmentId')):
+                            parts.append(part)
+                    if not parts:
+                        raise bb_alert_prn.AlertFileError(f'no .xlsx on "{subject}"')
+
+                    for part in parts:
+                        found += 1
+                        clean_name = self._sanitize_filename(part['filename'])
+                        final_name = f"{email['id']}_{clean_name}"
+                        if final_name in existing_files:
+                            skipped += 1
+                            continue
+                        attachment = self.gmail_service.users().messages().attachments().get(
+                            userId='me', messageId=email['id'], id=part['body']['attachmentId']
+                        ).execute()
+                        data = base64.urlsafe_b64decode(attachment['data'].encode('UTF-8'))
+                        parsed = bb_alert_prn.parse_handover(data)
+                        if not parsed['lines']:
+                            logger.info(f"[SKIP] PRN {parsed['prn']}: nothing collected")
+                            skipped += 1
+                            continue
+                        if not bb_alert_prn.depot_of(parsed['fc'])[2]:
+                            self.execution_stats['errors'].append(
+                                f"PRN {parsed['prn']}: new WMS depot {parsed['fc']}, add it to FC_DEPOT in "
+                                f"bb_alert_prn.py (loaded under its WMS name meanwhile)")
+                        prn_date = self._alert_initiated_date(parsed['prn'], parsed['fc'])
+                        handover_date = self._alert_mail_date(message['internalDate'])
+                        media = MediaIoBaseUpload(
+                            io.BytesIO(bb_alert_prn.to_old_layout(parsed, prn_date, handover_date)),
+                            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                        )
+                        self.drive_service.files().create(
+                            body={'name': final_name, 'parents': [folder_id]},
+                            media_body=media, fields='id'
+                        ).execute()
+                        existing_files.add(final_name)
+                        logger.info(f"[OK] PRN {parsed['prn']} {parsed['fc']}: {len(parsed['lines'])} lines, "
+                                    f"Rs {parsed['value']:.2f}, PRN date {prn_date or parsed['file_date']}")
+                        saved += 1
+                except Exception as e:
+                    failed += 1
+                    error_msg = f"WMS PRN mail {email.get('id', 'unknown')}: {str(e)}"
+                    logger.error(error_msg)
+                    self.execution_stats['errors'].append(error_msg)
+
+            self.execution_stats['attachments_found'] += found
+            self.execution_stats['attachments_saved'] += saved
+            self.execution_stats['attachments_skipped'] += skipped
+            self.execution_stats['attachments_failed'] += failed
+            logger.info(f"WMS alert PRN workflow completed! Found: {found}, Saved: {saved}, "
+                        f"Skipped: {skipped}, Failed: {failed}")
+            return {'success': True, 'processed': saved}
+
+        except Exception as e:
+            error_msg = f"WMS alert PRN workflow failed: {str(e)}"
+            logger.error(error_msg)
+            self.execution_stats['errors'].append(error_msg)
+            return {'success': False, 'processed': 0}
+
     def _get_source_file_names_from_sheet(self) -> Set[str]:
         """Get list of source file names that have already been processed"""
         try:
@@ -1487,6 +1621,7 @@ Total errors: {len(self.execution_stats['errors'])}
                 return False
             
             gmail_result = self.process_gmail_workflow()
+            self.process_alert_prn_workflow()
             excel_result = self.process_excel_workflow()
             
             self.execution_stats['end_time'] = datetime.now()

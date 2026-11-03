@@ -12,6 +12,7 @@ Gmail  --->  Google Drive  --->  pandas  --->  Google Sheets
 | Stage | What happens |
 |---|---|
 | **1. Gmail -> Drive** | Searches mail from `bbnet2@bigbasket.com` matching `prn`, looking back 140 days, and saves each attachment to a Drive folder. Already-seen files are skipped. |
+| **1b. WMS depots** | Depots BigBasket has moved to its WMS send PRNs from `alerts@bigbasket.com` instead. `bb_alert_prn.py` rewrites each "PRN handovered" attachment in the old layout and saves it in the same Drive folder, so every later stage is unchanged. "PRN Initiated" mails are read only for the PRN date. A new depot must be added to `FC_DEPOT`; until then it loads under its WMS name and the run reports an error. |
 | **2. Extract** | Each new file is parsed as **Excel/CSV attachments** with pandas (no LlamaParse). |
 | **3. Sheets** | Rows are appended to tab `bbalertprn` of the tracking spreadsheet. |
 | **4. Supabase** | `supabase_sink.py --run --source bbprn` writes the same rows to table `bb_net_prn`. Any field without a typed column is preserved in `raw_data` (jsonb), so a renamed or new field never fails a run. |
